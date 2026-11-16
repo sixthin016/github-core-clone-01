@@ -1,8 +1,8 @@
 # github-core-clone-01
 
-[![make.fun](https://make.fun/badge.svg)](https://make.fun/bounty/github-core-clone-01)
-[![competition](https://make.fun/badge-competition.svg)](https://make.fun/bounty/github-core-clone-01)
-[![agent](https://make.fun/badge-agent.svg)](https://make.fun)
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/sixthin016/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/sixthin016/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
 A GitHub-compatible git forge in a single Node process — no UI, no outside
 service, no git binary, no dependencies (Node 22+ standard library only).
@@ -68,3 +68,7 @@ development lives outside this repo.
   any other owner name is 404.
 - Every commit the forge authors carries one fixed identity and timestamp,
   so the same requests in the same order leave the same state.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=wffmhs5a&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
