@@ -17,9 +17,12 @@ import { parseRequest, pathSegments, sendError, sendJson } from './http.ts';
 import { handleMcp } from './mcp.ts';
 import { handleRest } from './rest.ts';
 import { Store } from './store.ts';
+import { tuneProcess } from './busypoll.ts';
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
+  // v8: opt-in process tuning only (env-gated, no-op by default).
+  tuneProcess();
   const store = new Store();
   return createRawServer((req: RawRequest, res: RawResponse) => {
     void (async () => {

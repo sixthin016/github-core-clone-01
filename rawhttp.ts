@@ -22,6 +22,7 @@
 //     listen(0) / address() / close() / once('error') exactly as before.
 
 import net from 'node:net';
+import { tuneSocket } from './busypoll.ts';
 
 export interface RawRequest {
   method: string;
@@ -198,6 +199,9 @@ function framingOf(head: ParsedHead): Framing | null {
 export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) => void): net.Server {
   return net.createServer((socket) => {
     socket.setNoDelay(true);
+    // v8: best-effort SO_BUSY_POLL on the accepted socket. tuneSocket never
+    // throws and is a no-op when the addon is absent or the call is refused.
+    tuneSocket(socket);
     // One growing buffer for the bytes not yet consumed (a view into the last
     // chunk once the head is eaten): a request that arrives in several TCP
     // segments used to re-concat every buffered chunk on every takeRequest
