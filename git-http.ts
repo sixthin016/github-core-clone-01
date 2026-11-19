@@ -8,7 +8,7 @@
 // line; a v2 fetch answers its sections (acknowledgments, shallow-info,
 // packfile) separated by flush packets, the pack carried in sideband band 1.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { RawRequest, RawResponse } from './rawhttp.ts';
 import {
   ZERO_OID,
   collectReachable,
@@ -16,6 +16,7 @@ import {
   encodePktLine,
   encodePktLines,
   isAncestor,
+  isHexByte,
   isObjectId,
   parseCommit,
   parseTag,
@@ -55,14 +56,39 @@ function advertisedRefs(repo: Repo): Array<{ oid: string; name: string; peeled?:
   return out;
 }
 
+/** Last v0 advertisement per repository, for the tip-patch fast path below. */
+const advTipCache = new WeakMap<Repo, { service: string; refsKey: string; tip: string; buf: Buffer }>();
+
 function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: Repo): Buffer {
   // Cached per git fingerprint: the clone round re-advertises one unchanged
   // repository 50 times, and each push re-advertises its own new tip once.
   const key = `v0:${service}:${repo.gitFingerprint()}`;
   const cached = repo.advCache.get(key);
   if (cached !== undefined) return cached;
-  const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
   const refs = advertisedRefs(repo);
+  const tip = repo.defaultTip();
+  // Fast path (the push workload: one head ref, no tags): only the tip moved
+  // since the last advertisement, so patch the two 40-hex occurrences of the
+  // old tip (the HEAD line and the ref line) instead of rebuilding. Anything
+  // else (new ref, tag, different service) falls through to the full build.
+  if (tip !== undefined && refs.length === 1 && refs[0]!.name === 'refs/heads/main' && refs[0]!.peeled === undefined) {
+    const prev = advTipCache.get(repo);
+    if (prev !== undefined && prev.service === service && prev.refsKey === 'refs/heads/main' && prev.tip !== tip) {
+      const oldTip = Buffer.from(prev.tip, 'ascii');
+      const first = prev.buf.indexOf(oldTip);
+      const second = first === -1 ? -1 : prev.buf.indexOf(oldTip, first + 40);
+      const third = second === -1 ? -1 : prev.buf.indexOf(oldTip, second + 40);
+      if (first !== -1 && second !== -1 && third === -1) {
+        const out = Buffer.from(prev.buf);
+        out.write(tip, first, 40, 'ascii');
+        out.write(tip, second, 40, 'ascii');
+        advTipCache.set(repo, { service, refsKey: 'refs/heads/main', tip, buf: out });
+        repo.cacheGit(repo.advCache, key, out);
+        return out;
+      }
+    }
+  }
+  const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
   const lines: Array<string | 'flush'> = [`# service=${service}\n`, 'flush'];
   const defaultTip = repo.defaultTip();
   if (refs.length === 0) {
@@ -76,6 +102,9 @@ function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: 
   }
   lines.push('flush');
   const out = encodePktLines(lines);
+  if (tip !== undefined && refs.length === 1 && refs[0]!.name === 'refs/heads/main' && refs[0]!.peeled === undefined) {
+    advTipCache.set(repo, { service, refsKey: 'refs/heads/main', tip, buf: out });
+  }
   repo.cacheGit(repo.advCache, key, out);
   return out;
 }
@@ -473,6 +502,11 @@ function parseReceivePackCommands(body: Buffer): { commands: PushCommand[]; pack
   let offset = 0;
   for (;;) {
     if (offset + 4 > body.length) throw new Error('truncated pkt-line stream');
+    // Manual 4-hex check (no regex): the push hot path parses one command
+    // list per receive-pack exchange.
+    for (let i = 0; i < 4; i += 1) {
+      if (!isHexByte(body[offset + i]!)) throw new Error('bad pkt-line length');
+    }
     const header = body.subarray(offset, offset + 4).toString('ascii');
     if (header === '0000') {
       offset += 4;
@@ -486,12 +520,39 @@ function parseReceivePackCommands(body: Buffer): { commands: PushCommand[]; pack
     const text = payload.toString('utf8');
     const nul = text.indexOf('\0');
     const head = nul >= 0 ? text.slice(0, nul) : text;
-    const match = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)\n?$/.exec(head);
-    if (!match) throw new Error(`bad receive-pack command line ${JSON.stringify(head.slice(0, 60))}`);
-    commands.push({ oldOid: match[1]!, newOid: match[2]!, ref: match[3]! });
+    // `<40-hex> <40-hex> <ref>\n?` parsed by hand: two spaces at fixed offsets.
+    if (head.length < 83 || head[40] !== ' ' || head[81] !== ' ') {
+      throw new Error(`bad receive-pack command line ${JSON.stringify(head.slice(0, 60))}`);
+    }
+    const oldOid = head.slice(0, 40);
+    const newOid = head.slice(41, 81);
+    const ref = head.slice(82).replace(/\n$/, '');
+    if (ref === '' || !isHex40(oldOid) || !isHex40(newOid) || !isRefName(ref)) {
+      throw new Error(`bad receive-pack command line ${JSON.stringify(head.slice(0, 60))}`);
+    }
+    commands.push({ oldOid, newOid, ref });
     offset += length;
   }
   return { commands, packStart: offset };
+}
+
+/** True when `value` is exactly 40 lowercase hex digits. */
+function isHex40(value: string): boolean {
+  if (value.length !== 40) return false;
+  for (let i = 0; i < 40; i += 1) {
+    const code = value.charCodeAt(i);
+    if (!((code >= 48 && code <= 57) || (code >= 97 && code <= 102))) return false;
+  }
+  return true;
+}
+
+/** True when `value` has no whitespace or control characters (a ref name). */
+function isRefName(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x20 || code === 0x7f) return false;
+  }
+  return true;
 }
 
 function handleReceivePack(repo: Repo, body: Buffer): Buffer {
@@ -576,8 +637,8 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
 /** Handle one git smart-HTTP request. Returns true when it answered. */
 export async function handleGit(
   store: Store,
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: RawRequest,
+  res: RawResponse,
   segments: string[],
 ): Promise<boolean> {
   if (segments.length < 2) return false;

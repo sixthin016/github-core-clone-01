@@ -9,7 +9,8 @@
 // Anything else is a JSON 404. A handler that throws answers a JSON 500 and
 // never takes the server down with it.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import { createRawServer, type RawRequest, type RawResponse } from './rawhttp.ts';
 import { handleGit } from './git-http.ts';
 import { handleGraphQL } from './graphql.ts';
 import { parseRequest, pathSegments, sendError, sendJson } from './http.ts';
@@ -20,14 +21,14 @@ import { Store } from './store.ts';
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const store = new Store();
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  return createRawServer((req: RawRequest, res: RawResponse) => {
     void (async () => {
       try {
         // Parse the URL once; every handler reads the stash via http.ts.
-        (req as IncomingMessage & { _parsed?: unknown })._parsed = parseRequest(req);
+        (req as RawRequest & { _parsed?: unknown })._parsed = parseRequest(req);
         const segments = pathSegments(req);
         const method = req.method ?? 'GET';
-        const path = (req as IncomingMessage & { _parsed?: { path: string } })._parsed!.path;
+        const path = (req as RawRequest & { _parsed?: { path: string } })._parsed!.path;
 
         // The env's boot check calls this twice: 200 {"ok":true}.
         if (method === 'GET' && path === '/healthz') {

@@ -8,7 +8,7 @@
 // array naming the field; an unknown repository answers data.repository null
 // with no errors; a missing token is 401.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { RawRequest, RawResponse } from './rawhttp.ts';
 import { readBody, sendError, sendJson } from './http.ts';
 import {
   FIXED_ISO,
@@ -977,7 +977,7 @@ function executeOperation(store: Store, operation: OperationNode, variables: Rec
 }
 
 /** Handle one GraphQL request. Returns true when it answered. */
-export async function handleGraphQL(store: Store, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+export async function handleGraphQL(store: Store, req: RawRequest, res: RawResponse): Promise<boolean> {
   if (req.method !== 'POST') return false;
   const authorization = req.headers.authorization ?? '';
   if (!authorization.startsWith('Bearer ') || authorization.slice('Bearer '.length).trim() === '') {

@@ -10,7 +10,7 @@
 // body that is not JSON is HTTP 400 with JSON-RPC -32700; no Authorization
 // header is HTTP 401.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { RawRequest, RawResponse } from './rawhttp.ts';
 import { readBody, sendJson } from './http.ts';
 import { issueJson, pullJson, repoJson } from './rest.ts';
 import {
@@ -244,16 +244,16 @@ function callTool(store: Store, name: string, args: Record<string, unknown>): To
   }
 }
 
-function rpcResult(store: Store, res: ServerResponse, id: unknown, result: unknown): void {
+function rpcResult(store: Store, res: RawResponse, id: unknown, result: unknown): void {
   sendJson(store, res, 200, { jsonrpc: '2.0', id: id ?? null, result });
 }
 
-function rpcError(store: Store, res: ServerResponse, id: unknown, code: number, message: string): void {
+function rpcError(store: Store, res: RawResponse, id: unknown, code: number, message: string): void {
   sendJson(store, res, 200, { jsonrpc: '2.0', id: id ?? null, error: { code, message } });
 }
 
 /** Handle one MCP request. Returns true when it answered. */
-export async function handleMcp(store: Store, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+export async function handleMcp(store: Store, req: RawRequest, res: RawResponse): Promise<boolean> {
   if (req.method !== 'POST') return false;
   const authorization = req.headers.authorization ?? '';
   if (!authorization.startsWith('Bearer ') || authorization.slice('Bearer '.length).trim() === '') {

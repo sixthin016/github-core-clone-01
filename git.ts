@@ -72,6 +72,10 @@ export type DecodedPacket =
   | { kind: 'delim' }
   | { kind: 'response-end' };
 
+export function isHexByte(code: number): boolean {
+  return (code >= 48 && code <= 57) || (code >= 97 && code <= 102) || (code >= 65 && code <= 70);
+}
+
 /**
  * Decode a whole buffer of pkt-lines. Returns null when the bytes are not a
  * well-formed pkt-line stream (bad length, truncated packet, length over the
@@ -83,8 +87,12 @@ export function decodePktLines(bytes: Buffer): { packets: DecodedPacket[]; consu
   let offset = 0;
   while (offset < bytes.length) {
     if (offset + 4 > bytes.length) return null;
+    // Manual hex check (no regex, no toString): the hot path decodes every
+    // upload-pack request's pkt-lines.
+    for (let i = 0; i < 4; i += 1) {
+      if (!isHexByte(bytes[offset + i]!)) return null;
+    }
     const head = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) return null;
     const length = Number.parseInt(head, 16);
     if (length === 0) {
       packets.push({ kind: 'flush' });

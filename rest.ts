@@ -5,7 +5,7 @@
 // other than the token's viewer is 404 (never 403); a malformed JSON body is
 // 400; an unknown route is a JSON 404. A duplicate repository name is 422.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { RawRequest, RawResponse } from './rawhttp.ts';
 import {
   flattenTree,
   lineDiff,
@@ -24,7 +24,7 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { parseJsonBody, pathSegments, queryInt, queryOf, readBody, sendError, sendJson, sendJsonText } from './http.ts';
+import { parseJsonBody, pathSegments, queryInt, queryOf, readBody, sendError, sendJson, sendJsonBuffer, sendJsonText } from './http.ts';
 
 /** Count the lines of a text blob (a trailing newline ends the last line). */
 function lineCount(text: string): number {
@@ -92,11 +92,11 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
  * every mutation (PATCH, comment create, GraphQL close/comment): the read
  * workload GETs one unchanged issue 2,000 times in a row.
  */
-export function issueJsonText(repo: Repo, issue: Issue): string {
+export function issueJsonText(repo: Repo, issue: Issue): Buffer {
   if (issue.jsonCache !== null) return issue.jsonCache;
-  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
-  issue.jsonCache = text;
-  return text;
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issue.jsonCache = buf;
+  return buf;
 }
 
 /** Invalidate an issue's cached body after a mutation. */
@@ -185,8 +185,8 @@ export function pullFiles(repo: Repo, pr: PullRequest): Array<Record<string, unk
 /** A page of `items` with a Link header when more pages follow. */
 function page<T>(
   store: Store,
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: RawRequest,
+  res: RawResponse,
   items: T[],
   render: (item: T) => unknown,
 ): void {
@@ -220,7 +220,7 @@ function stringField(body: Record<string, unknown>, field: string): string {
 }
 
 /** Handle one REST request. Returns true when it answered. */
-export async function handleRest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+export async function handleRest(store: Store, req: RawRequest, res: RawResponse): Promise<boolean> {
   const segments = pathSegments(req);
   if (segments.length < 2 || segments[0] !== 'api' || segments[1] !== 'v3') return false;
   const rest = segments.slice(2);
@@ -574,7 +574,7 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
           return true;
         }
         if (method === 'GET') {
-          sendJsonText(store, res, 200, issueJsonText(repo, issue));
+          sendJsonBuffer(store, res, 200, issueJsonText(repo, issue));
           return true;
         }
         if (method === 'PATCH') {

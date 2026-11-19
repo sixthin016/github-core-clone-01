@@ -71,8 +71,8 @@ export interface Issue {
   comments: Comment[];
   /** Mutation counter; issueJsonText caches the serialised body per revision. */
   rev: number;
-  /** Cached `${JSON.stringify(issueJson)}` + newline, or null when stale. */
-  jsonCache: string | null;
+  /** Cached serialised body as bytes (avoids a Buffer.from per GET), or null when stale. */
+  jsonCache: Buffer | null;
 }
 
 export interface Comment {
