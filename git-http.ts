@@ -555,6 +555,40 @@ function isRefName(value: string): boolean {
   return true;
 }
 
+/** Fully sideband-framed report-status buffers, keyed by the report's lines:
+ * the push workload answers the same single-ok-ref report 200 times in a
+ * row, so rebuilding its pkt-lines + sideband framing + concat per push is
+ * pure waste. The buffer is never mutated after it is built, so sharing it
+ * across requests is safe. Capped like the other git caches. */
+const receiveReportCache = new Map<string, Buffer>();
+
+function framedReceiveReport(
+  unpackError: string | null,
+  results: ReadonlyArray<{ ref: string; ok: boolean; reason: string }>,
+): Buffer {
+  let key = unpackError === null ? 'unpack ok\n' : `unpack ${unpackError}\n`;
+  for (const result of results) key += result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`;
+  const cached = receiveReportCache.get(key);
+  if (cached !== undefined) return cached;
+  const reportLines: Array<string | 'flush'> = [
+    unpackError !== null ? `unpack ${unpackError}\n` : 'unpack ok\n',
+  ];
+  for (const result of results) {
+    reportLines.push(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`);
+  }
+  reportLines.push('flush');
+  const report = encodePktLines(reportLines);
+  // Sideband band 1 around the report, one allocation per chunk.
+  const chunks: Buffer[] = sidebandPack(report);
+  // The sideband stream ends with a flush packet of its own: without it a
+  // real git client reports a sideband demultiplexer error.
+  chunks.push(encodePktLines(['flush']));
+  const out = Buffer.concat(chunks);
+  if (receiveReportCache.size >= 64) receiveReportCache.clear();
+  receiveReportCache.set(key, out);
+  return out;
+}
+
 function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   const { commands, packStart } = parseReceivePackCommands(body);
   if (commands.length === 0) throw new Error('receive-pack sent no commands');
@@ -618,20 +652,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
     }
   }
 
-  const reportLines: Array<string | 'flush'> = [
-    unpackError !== null ? `unpack ${unpackError}\n` : 'unpack ok\n',
-  ];
-  for (const result of results) {
-    reportLines.push(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason}\n`);
-  }
-  reportLines.push('flush');
-  const report = encodePktLines(reportLines);
-  // Sideband band 1 around the report, one allocation per chunk.
-  const chunks: Buffer[] = sidebandPack(report);
-  // The sideband stream ends with a flush packet of its own: without it a
-  // real git client reports a sideband demultiplexer error.
-  chunks.push(encodePktLines(['flush']));
-  return Buffer.concat(chunks);
+  return framedReceiveReport(unpackError, results);
 }
 
 /** Handle one git smart-HTTP request. Returns true when it answered. */

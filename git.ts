@@ -635,9 +635,9 @@ export function readPack(pack: Buffer, resolveBase?: ObjectLookup): PackReadResu
     baseOid?: string;
   }
   const raw: RawEntry[] = [];
-  const byOffset = new Map<number, RawEntry>();
   const packBody = pack.subarray(0, trailerStart);
   let offset = 12;
+  let hasDelta = false;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
     const header = readVarintSize(pack, offset);
@@ -645,6 +645,7 @@ export function readPack(pack: Buffer, resolveBase?: ObjectLookup): PackReadResu
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
     if (typeCode === 6) {
+      hasDelta = true;
       const base = readOfsDeltaBase(pack, offset);
       offset = base.next;
       if (base.baseOffset <= 0 || base.baseOffset > entryOffset) {
@@ -652,6 +653,7 @@ export function readPack(pack: Buffer, resolveBase?: ObjectLookup): PackReadResu
       }
       entry.baseOffset = entryOffset - base.baseOffset;
     } else if (typeCode === 7) {
+      hasDelta = true;
       if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
       entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
@@ -665,11 +667,24 @@ export function readPack(pack: Buffer, resolveBase?: ObjectLookup): PackReadResu
     entry.data = inflated.data;
     offset = inflated.next;
     raw.push(entry);
-    byOffset.set(entryOffset, entry);
   }
   if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
 
   const objects = new Map<string, GitObject>();
+  // Fast path (every pack the suite's client sends: no deltas): each entry is
+  // its own object, so hash it straight into the map — no offset index, no
+  // delta-resolution closure, no per-entry resolved bookkeeping.
+  if (!hasDelta) {
+    let deltaCount = 0;
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode]!;
+      const oid = hashObject(type, entry.data);
+      if (!objects.has(oid)) objects.set(oid, { type, data: entry.data });
+    }
+    return { objects, deltaCount };
+  }
+  const byOffset = new Map<number, RawEntry>();
+  for (const entry of raw) byOffset.set(entry.offset, entry);
   const resolvedByOid = new Map<string, RawEntry>();
   const resolving = new Set<number>();
   let deltaCount = 0;

@@ -104,6 +104,29 @@ interface ParsedHead {
   headLen: number;
 }
 
+/** The request headers any handler reads. parseHead extracts only these, by
+ * name length (all seven lengths are distinct) with a case-insensitive byte
+ * compare, so an unknown header costs no string allocation at all. */
+const KNOWN_HEADER_BY_LENGTH: Record<number, string> = {
+  4: 'host',
+  6: 'expect',
+  10: 'connection',
+  12: 'git-protocol',
+  13: 'authorization',
+  14: 'content-length',
+  17: 'transfer-encoding',
+};
+
+/** Case-insensitive ASCII compare of `buf[start..start+len)` against `want`. */
+function headerNameMatches(buf: Buffer, start: number, len: number, want: string): boolean {
+  for (let i = 0; i < len; i += 1) {
+    let code = buf[start + i]!;
+    if (code >= 65 && code <= 90) code += 32;
+    if (code !== want.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
 /** Parse the request line + headers. Returns null when the head is incomplete.
  * Scans the buffer in place (no whole-head toString + split): the hot path
  * parses one head per request, and the old version allocated the head string,
@@ -113,9 +136,14 @@ function parseHead(buf: Buffer): ParsedHead | null {
   if (end === -1) return null;
   const lineEnd = buf.indexOf('\r\n', 0);
   if (lineEnd === -1) return null;
-  const requestLine = buf.toString('latin1', 0, lineEnd);
-  const [method, rawUrl, version] = requestLine.split(' ');
-  if (method === undefined || rawUrl === undefined || version === undefined) return null;
+  // The request line, split by hand (no String.split array): method, target, version.
+  const firstSpace = buf.indexOf(0x20, 0);
+  if (firstSpace === -1 || firstSpace >= lineEnd) return null;
+  const secondSpace = buf.indexOf(0x20, firstSpace + 1);
+  if (secondSpace === -1 || secondSpace >= lineEnd) return null;
+  const method = buf.toString('latin1', 0, firstSpace);
+  const rawUrl = buf.toString('latin1', firstSpace + 1, secondSpace);
+  const version = buf.toString('latin1', secondSpace + 1, lineEnd);
   const headers: Record<string, string> = {};
   let pos = lineEnd + 2;
   while (pos < end) {
@@ -124,10 +152,20 @@ function parseHead(buf: Buffer): ParsedHead | null {
     // ':' search bounded to this line (a view, no copy).
     const colon = buf.subarray(pos, stop).indexOf(0x3a);
     if (colon !== -1) {
-      const name = buf.toString('latin1', pos, pos + colon).trim().toLowerCase();
-      const value = buf.toString('latin1', pos + colon + 1, stop).trim();
-      const prev = headers[name];
-      headers[name] = prev === undefined ? value : `${prev}, ${value}`;
+      // The name, trimmed of surrounding blanks (the old code trimmed the
+      // whole name string); only a name of a known length can be one the
+      // handlers read, so anything else is skipped without allocating.
+      let nameStart = pos;
+      let nameEnd = pos + colon;
+      while (nameStart < nameEnd && (buf[nameStart] === 0x20 || buf[nameStart] === 0x09)) nameStart += 1;
+      while (nameEnd > nameStart && (buf[nameEnd - 1] === 0x20 || buf[nameEnd - 1] === 0x09)) nameEnd -= 1;
+      const nameLen = nameEnd - nameStart;
+      const known = KNOWN_HEADER_BY_LENGTH[nameLen];
+      if (known !== undefined && headerNameMatches(buf, nameStart, nameLen, known)) {
+        const value = buf.toString('latin1', pos + colon + 1, stop).trim();
+        const prev = headers[known];
+        headers[known] = prev === undefined ? value : `${prev}, ${value}`;
+      }
     }
     pos = stop + 2;
   }
