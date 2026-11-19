@@ -104,24 +104,32 @@ interface ParsedHead {
   headLen: number;
 }
 
-/** Parse the request line + headers. Returns null when the head is incomplete. */
+/** Parse the request line + headers. Returns null when the head is incomplete.
+ * Scans the buffer in place (no whole-head toString + split): the hot path
+ * parses one head per request, and the old version allocated the head string,
+ * a lines array and one string per line. */
 function parseHead(buf: Buffer): ParsedHead | null {
   const end = buf.indexOf('\r\n\r\n');
   if (end === -1) return null;
-  const head = buf.subarray(0, end).toString('latin1');
-  const lines = head.split('\r\n');
-  const requestLine = lines[0] ?? '';
+  const lineEnd = buf.indexOf('\r\n', 0);
+  if (lineEnd === -1) return null;
+  const requestLine = buf.toString('latin1', 0, lineEnd);
   const [method, rawUrl, version] = requestLine.split(' ');
   if (method === undefined || rawUrl === undefined || version === undefined) return null;
   const headers: Record<string, string> = {};
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i]!;
-    const colon = line.indexOf(':');
-    if (colon === -1) continue;
-    const name = line.slice(0, colon).trim().toLowerCase();
-    const value = line.slice(colon + 1).trim();
-    const prev = headers[name];
-    headers[name] = prev === undefined ? value : `${prev}, ${value}`;
+  let pos = lineEnd + 2;
+  while (pos < end) {
+    const eol = buf.indexOf('\r\n', pos);
+    const stop = eol === -1 ? end : eol;
+    // ':' search bounded to this line (a view, no copy).
+    const colon = buf.subarray(pos, stop).indexOf(0x3a);
+    if (colon !== -1) {
+      const name = buf.toString('latin1', pos, pos + colon).trim().toLowerCase();
+      const value = buf.toString('latin1', pos + colon + 1, stop).trim();
+      const prev = headers[name];
+      headers[name] = prev === undefined ? value : `${prev}, ${value}`;
+    }
+    pos = stop + 2;
   }
   let url = rawUrl;
   if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -152,8 +160,13 @@ function framingOf(head: ParsedHead): Framing | null {
 export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) => void): net.Server {
   return net.createServer((socket) => {
     socket.setNoDelay(true);
-    let chunks: Buffer[] = [];
-    let buffered = 0;
+    // One growing buffer for the bytes not yet consumed (a view into the last
+    // chunk once the head is eaten): a request that arrives in several TCP
+    // segments used to re-concat every buffered chunk on every takeRequest
+    // call. `pending` remembers the parsed head + framing while the body is
+    // still arriving, so a split request is not re-parsed per segment.
+    let buf: Buffer = Buffer.alloc(0);
+    let pending: { head: ParsedHead; framing: Framing } | null = null;
     let busy = false;
     let closed = false;
 
@@ -169,31 +182,43 @@ export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) =
 
     /** Try to take one complete request out of the buffered bytes. */
     const takeRequest = (): { req: RawRequest; keepAlive: boolean } | null => {
-      if (chunks.length === 0) return null;
-      const buf = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, buffered);
-      if (buf.length > MAX_HEADER_BYTES && buf.indexOf('\r\n\r\n') === -1) return null;
-      const head = parseHead(buf);
-      if (head === null) return null;
-      const framing = framingOf(head);
-      if (framing === null) return null;
+      if (buf.length === 0) return null;
+      let head: ParsedHead;
+      let framing: Framing;
+      if (pending !== null) {
+        ({ head, framing } = pending);
+      } else {
+        if (buf.length > MAX_HEADER_BYTES && buf.indexOf('\r\n\r\n') === -1) return null;
+        const parsed = parseHead(buf);
+        if (parsed === null) return null;
+        const fr = framingOf(parsed);
+        if (fr === null) return null;
+        head = parsed;
+        framing = fr;
+      }
       let body: Buffer;
       let consumed: number;
       if (framing.kind === 'length') {
-        if (buf.length < head.headLen + framing.length) return null;
+        if (buf.length < head.headLen + framing.length) {
+          pending = { head, framing };
+          return null;
+        }
         body = buf.subarray(head.headLen, head.headLen + framing.length);
         consumed = head.headLen + framing.length;
       } else if (framing.kind === 'chunked') {
         const parsed = parseChunked(buf.subarray(head.headLen));
-        if (parsed === null) return null;
+        if (parsed === null) {
+          pending = { head, framing };
+          return null;
+        }
         body = parsed.body;
         consumed = head.headLen + parsed.consumed;
       } else {
         body = Buffer.alloc(0);
         consumed = head.headLen;
       }
-      const rest = buf.subarray(consumed);
-      chunks = rest.length > 0 ? [Buffer.from(rest)] : [];
-      buffered = rest.length;
+      buf = buf.subarray(consumed);
+      pending = null;
       const connection = (head.headers.connection ?? '').toLowerCase();
       const keepAlive =
         connection.includes('close') ? false : connection.includes('keep-alive') ? true : head.version === 'HTTP/1.1';
@@ -234,7 +259,9 @@ export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) =
           const body = chunk === undefined ? Buffer.alloc(0) : typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
           const noBody = status === 204 || status === 304;
           const out = noBody ? Buffer.alloc(0) : body;
-          const lines: string[] = [`HTTP/1.1 ${status} ${REASONS[status] ?? ''}`];
+          // One string build, one Buffer.from: the old version built a lines
+          // array and joined it per response.
+          let headStr = `HTTP/1.1 ${status} ${REASONS[status] ?? ''}\r\n`;
           let hasLength = false;
           let hasConnection = false;
           let hasDate = false;
@@ -243,12 +270,12 @@ export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) =
             if (lower === 'content-length') hasLength = true;
             if (lower === 'connection') hasConnection = true;
             if (lower === 'date') hasDate = true;
-            lines.push(`${name}: ${headers[name]}`);
+            headStr += `${name}: ${headers[name]}\r\n`;
           }
-          if (!hasLength) lines.push(`content-length: ${out.length}`);
-          if (!hasConnection) lines.push(`connection: ${keepAlive ? 'keep-alive' : 'close'}`);
-          if (!hasDate) lines.push(`date: ${dateHeader()}`);
-          const head = Buffer.from(`${lines.join('\r\n')}\r\n\r\n`, 'latin1');
+          if (!hasLength) headStr += `content-length: ${out.length}\r\n`;
+          if (!hasConnection) headStr += `connection: ${keepAlive ? 'keep-alive' : 'close'}\r\n`;
+          if (!hasDate) headStr += `date: ${dateHeader()}\r\n`;
+          const head = Buffer.from(`${headStr}\r\n`, 'latin1');
           res.headersSent = true;
           try {
             socket.cork();
@@ -281,9 +308,8 @@ export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) =
 
     socket.on('data', (chunk: Buffer) => {
       if (closed) return;
-      chunks.push(chunk);
-      buffered += chunk.length;
-      if (buffered > MAX_BODY_BYTES + MAX_HEADER_BYTES) {
+      buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+      if (buf.length > MAX_BODY_BYTES + MAX_HEADER_BYTES) {
         closeSocket();
         return;
       }

@@ -126,12 +126,23 @@ export class Repo {
   readonly lsRefsCache = new Map<string, Buffer>();
   readonly advCache = new Map<string, Buffer>();
 
-  /** The git state a cached git response was built from. */
+  /** The git state a cached git response was built from. Cached: the
+   * fingerprint is rebuilt from the refs on every cache-key lookup
+   * (advertisement, ls-refs, fetch), and it only changes when a ref moves
+   * or an object is added, so it is memoised and bumped by the mutators. */
+  private fingerprintCache: string | null = null;
+
   gitFingerprint(): string {
+    if (this.fingerprintCache !== null) return this.fingerprintCache;
     const refs = [...this.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
     let out = `${this.objects.size}|`;
     for (const [name, oid] of refs) out += `${name}=${oid};`;
+    this.fingerprintCache = out;
     return out;
+  }
+
+  private bumpFingerprint(): void {
+    this.fingerprintCache = null;
   }
 
   /** Store a cached git response, clearing the map when it grows too large. */
@@ -163,23 +174,34 @@ export class Repo {
 
   put(type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      this.bumpFingerprint();
+    }
     return oid;
   }
 
   /** Store a pack object under its id (receive-pack's path into the store). */
   addObject(oid: string, object: GitObject): void {
-    if (!this.objects.has(oid)) this.objects.set(oid, object);
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, object);
+      this.bumpFingerprint();
+    }
   }
 
   /** Set any ref (heads, tags, …). */
   setRef(ref: string, oid: string): void {
-    this.refs.set(ref, oid);
+    if (this.refs.get(ref) !== oid) {
+      this.refs.set(ref, oid);
+      this.bumpFingerprint();
+    }
   }
 
   /** Delete any ref; false when it did not exist. */
   deleteRef(ref: string): boolean {
-    return this.refs.delete(ref);
+    const deleted = this.refs.delete(ref);
+    if (deleted) this.bumpFingerprint();
+    return deleted;
   }
 
   lookup = (oid: string): GitObject | undefined => this.objects.get(oid);
