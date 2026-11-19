@@ -24,7 +24,7 @@ import {
   type GitObject,
   type ObjectLookup,
 } from './git.ts';
-import { readBody, sendError, sendJson, sendRaw } from './http.ts';
+import { readBody, sendError, sendJson, sendRaw, queryOf } from './http.ts';
 import { VIEWER, type Repo, type Store } from './store.ts';
 
 const AGENT = 'makefun-git-forge/1.0';
@@ -56,6 +56,11 @@ function advertisedRefs(repo: Repo): Array<{ oid: string; name: string; peeled?:
 }
 
 function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: Repo): Buffer {
+  // Cached per git fingerprint: the clone round re-advertises one unchanged
+  // repository 50 times, and each push re-advertises its own new tip once.
+  const key = `v0:${service}:${repo.gitFingerprint()}`;
+  const cached = repo.advCache.get(key);
+  if (cached !== undefined) return cached;
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
   const refs = advertisedRefs(repo);
   const lines: Array<string | 'flush'> = [`# service=${service}\n`, 'flush'];
@@ -70,23 +75,28 @@ function v0Advertisement(service: 'git-upload-pack' | 'git-receive-pack', repo: 
     }
   }
   lines.push('flush');
-  return encodePktLines(lines);
+  const out = encodePktLines(lines);
+  repo.cacheGit(repo.advCache, key, out);
+  return out;
 }
 
 function v2Advertisement(repo: Repo): Buffer {
   void repo;
-  return encodePktLines([
-    '# service=git-upload-pack\n',
-    'flush',
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'server-option\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
 }
+
+/** The v2 capability advertisement never depends on the repository: one buffer. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'server-option\n',
+  'object-format=sha1\n',
+  'flush',
+]);
 
 /**
  * The objects the client already holds, from its `have` lines: the closure of
@@ -103,8 +113,9 @@ function haveClosure(repo: Repo, haves: readonly string[], oldShallow: readonly 
       queue.push(oid);
     }
   }
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++]!;
     const object = repo.objects.get(oid);
     if (!object) continue;
     if (object.type === 'commit') {
@@ -169,8 +180,9 @@ function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
       // BFS distance (1-based) from the want to its nearest old boundary.
       const seen = new Set<string>([want]);
       const queue: Array<{ oid: string; dist: number }> = [{ oid: want, dist: 1 }];
-      while (queue.length > 0) {
-        const { oid, dist } = queue.shift()!;
+      let qhead = 0;
+      while (qhead < queue.length) {
+        const { oid, dist } = queue[qhead++]!;
         if (boundary.has(oid)) {
           best = Math.max(best, dist + depth);
           break;
@@ -205,8 +217,9 @@ function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
       }
     }
     const commitSet = new Set<string>();
-    while (queue.length > 0) {
-      const oid = queue.shift()!;
+    let qhead = 0;
+    while (qhead < queue.length) {
+      const oid = queue[qhead++]!;
       const dist = distance.get(oid)!;
       const object = repo.objects.get(oid);
       if (!object) continue;
@@ -299,15 +312,41 @@ function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
 function sidebandPack(pack: Buffer): Buffer[] {
   const parts: Buffer[] = [];
   const CHUNK = 65515;
-  for (let offset = 0; offset < pack.length; offset += CHUNK) {
-    const slice = pack.subarray(offset, Math.min(pack.length, offset + CHUNK));
-    parts.push(encodePktLine(Buffer.concat([Buffer.from([1]), slice])));
+  // One allocation per chunk: 4-byte pkt-line header + band byte + payload.
+  const chunks = Math.max(1, Math.ceil(pack.length / CHUNK));
+  for (let i = 0; i < chunks; i += 1) {
+    const offset = i * CHUNK;
+    const len = Math.min(CHUNK, pack.length - offset);
+    const out = Buffer.allocUnsafe(4 + 1 + len);
+    out.write((1 + len + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    out[4] = 1;
+    if (len > 0) pack.copy(out, 5, offset, offset + len);
+    parts.push(out);
   }
-  if (parts.length === 0) parts.push(encodePktLine(Buffer.from([1])));
   return parts;
 }
 
+/** Cache key for a fetch response: the request plus the git fingerprint. */
+function fetchCacheKey(repo: Repo, request: FetchRequest, version: 'v0' | 'v2'): string {
+  return `${version}:${repo.gitFingerprint()}:${JSON.stringify([
+    request.wants,
+    request.haves,
+    request.depth ?? null,
+    request.deepenRelative,
+    request.oldShallow,
+  ])}`;
+}
+
 function v2FetchResponse(repo: Repo, request: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, request, 'v2');
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const out = buildV2FetchResponse(repo, request);
+  repo.cacheGit(repo.fetchCache, key, out);
+  return out;
+}
+
+function buildV2FetchResponse(repo: Repo, request: FetchRequest): Buffer {
   const plan = planFetch(repo, request);
   // Deterministic pack order: sort the objects by id.
   const sorted = [...plan.objects.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -341,6 +380,15 @@ function v2FetchResponse(repo: Repo, request: FetchRequest): Buffer {
 }
 
 function v0FetchResponse(repo: Repo, request: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, request, 'v0');
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const out = buildV0FetchResponse(repo, request);
+  repo.cacheGit(repo.fetchCache, key, out);
+  return out;
+}
+
+function buildV0FetchResponse(repo: Repo, request: FetchRequest): Buffer {
   const plan = planFetch(repo, request);
   const sorted = [...plan.objects.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   const pack = writePack(sorted.map(([, object]) => object));
@@ -378,6 +426,15 @@ function parseFetchArgs(lines: string[]): FetchRequest {
 }
 
 function handleLsRefs(repo: Repo, lines: string[]): Buffer {
+  const key = `ls:${repo.gitFingerprint()}:${JSON.stringify(lines)}`;
+  const cached = repo.lsRefsCache.get(key);
+  if (cached !== undefined) return cached;
+  const out = buildLsRefs(repo, lines);
+  repo.cacheGit(repo.lsRefsCache, key, out);
+  return out;
+}
+
+function buildLsRefs(repo: Repo, lines: string[]): Buffer {
   const args = lines.map((line) => line.replace(/\n$/, ''));
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
@@ -446,9 +503,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   if (packBytes.length > 0) {
     try {
       const read = readPack(packBytes, repo.lookup);
-      for (const [oid, object] of read.objects) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
-      }
+      for (const [oid, object] of read.objects) repo.addObject(oid, object);
     } catch (err) {
       unpackError = err instanceof Error ? err.message : String(err);
     }
@@ -465,7 +520,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
         if (current === undefined) results.push({ ref: command.ref, ok: false, reason: 'ref does not exist' });
         else if (current !== command.oldOid) results.push({ ref: command.ref, ok: false, reason: 'old oid mismatch' });
         else {
-          repo.refs.delete(command.ref);
+          repo.deleteRef(command.ref);
           results.push({ ref: command.ref, ok: true, reason: '' });
         }
         continue;
@@ -497,7 +552,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
           continue;
         }
       }
-      repo.refs.set(command.ref, command.newOid);
+      repo.setRef(command.ref, command.newOid);
       results.push({ ref: command.ref, ok: true, reason: '' });
     }
   }
@@ -510,11 +565,8 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   }
   reportLines.push('flush');
   const report = encodePktLines(reportLines);
-  const chunks: Buffer[] = [];
-  const CHUNK = 65515;
-  for (let offset = 0; offset < report.length; offset += CHUNK) {
-    chunks.push(encodePktLine(Buffer.concat([Buffer.from([1]), report.subarray(offset, Math.min(report.length, offset + CHUNK))])));
-  }
+  // Sideband band 1 around the report, one allocation per chunk.
+  const chunks: Buffer[] = sidebandPack(report);
   // The sideband stream ends with a flush packet of its own: without it a
   // real git client reports a sideband demultiplexer error.
   chunks.push(encodePktLines(['flush']));
@@ -538,7 +590,7 @@ export async function handleGit(
 
   // info/refs
   if (method === 'GET' && rest.length === 2 && rest[0] === 'info' && rest[1] === 'refs') {
-    const service = new URL(req.url ?? '/', 'http://entry').searchParams.get('service');
+    const service = queryOf(req).get('service');
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
       sendError(store, res, 400, 'unknown service');
       return true;

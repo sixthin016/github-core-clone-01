@@ -861,6 +861,8 @@ function executeRootField(
       labels: [],
       createdSeq: repo.nextSeq(),
       comments: [],
+      rev: 0,
+      jsonCache: null,
     };
     repo.issues.set(number, issue);
     const payload: GqlObject = { __type: 'CreateIssuePayload', repo, issue };
@@ -875,6 +877,8 @@ function executeRootField(
       return { data, handled: true };
     }
     found.issue.state = 'closed';
+    found.issue.rev += 1;
+    found.issue.jsonCache = null;
     const payload: GqlObject = { __type: 'CloseIssuePayload', repo: found.repo, issue: found.issue };
     data[field.alias] = resolveValue(exec, payload, field.selections, variables);
     return { data, handled: true };
@@ -944,6 +948,8 @@ function executeRootField(
     const comment = { id: found.repo.nextCommentId, body: typeof inputRecord.body === 'string' ? inputRecord.body : '' };
     found.repo.nextCommentId += 1;
     found.issue.comments.push(comment);
+    found.issue.rev += 1;
+    found.issue.jsonCache = null;
     const commentId = globalId('comment', `${found.repo.fullName}#${found.issue.number}#${comment.id}`);
     const payload: GqlObject = { __type: 'AddCommentPayload', id: commentId, body: comment.body };
     data[field.alias] = resolveValue(exec, payload, field.selections, variables);

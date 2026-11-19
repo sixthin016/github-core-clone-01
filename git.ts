@@ -44,9 +44,12 @@ export type PktItem = string | Buffer | 'flush' | 'delim' | 'response-end';
 export function encodePktLine(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   if (data.length > 65516) throw new Error('pkt-line payload over the 65516-byte maximum');
-  const header = Buffer.alloc(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  // One allocation: header + payload in a single buffer (hot path: advertisements,
+  // sideband chunks, fetch responses).
+  const out = Buffer.allocUnsafe(4 + data.length);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
 
 export const pktFlush = (): Buffer => Buffer.from('0000', 'ascii');
@@ -293,8 +296,9 @@ export function mergeBase(a: string, b: string, lookup: ObjectLookup): string | 
   if (a === b) return a;
   const fromA = new Set<string>();
   const queueA = [a];
-  while (queueA.length > 0) {
-    const oid = queueA.shift()!;
+  let headA = 0;
+  while (headA < queueA.length) {
+    const oid = queueA[headA++]!;
     if (fromA.has(oid)) continue;
     fromA.add(oid);
     const object = lookup(oid);
@@ -302,8 +306,9 @@ export function mergeBase(a: string, b: string, lookup: ObjectLookup): string | 
   }
   const seenB = new Set<string>();
   const queueB = [b];
-  while (queueB.length > 0) {
-    const oid = queueB.shift()!;
+  let headB = 0;
+  while (headB < queueB.length) {
+    const oid = queueB[headB++]!;
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     if (fromA.has(oid)) return oid;
@@ -451,18 +456,31 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
 /** Build a packfile (version 2, no deltas) from plain objects. */
 export function writePack(objects: Iterable<GitObject>): Buffer {
   const list = [...objects];
-  const parts: Buffer[] = [];
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(list.length, 8);
-  parts.push(header);
-  for (const object of list) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+  // Deflate first, then lay the whole pack out in one allocation (hot path:
+  // every clone fetch builds a pack; the old version concatenated per object).
+  const encoded: Buffer[] = new Array(list.length);
+  let total = 12 + 20;
+  for (let i = 0; i < list.length; i += 1) {
+    const object = list[i]!;
+    const deflated = deflateSync(object.data);
+    const header = writePackObjectHeader(object.type, object.data.length);
+    const entry = Buffer.allocUnsafe(header.length + deflated.length);
+    header.copy(entry, 0);
+    deflated.copy(entry, header.length);
+    encoded[i] = entry;
+    total += entry.length;
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const out = Buffer.allocUnsafe(total);
+  out.write('PACK', 0, 4, 'ascii');
+  out.writeUInt32BE(2, 4);
+  out.writeUInt32BE(list.length, 8);
+  let offset = 12;
+  for (const entry of encoded) {
+    entry.copy(out, offset);
+    offset += entry.length;
+  }
+  createHash('sha1').update(out.subarray(0, offset)).digest().copy(out, offset);
+  return out;
 }
 
 /** SHA-1 of every pack byte before the 20-byte trailer. */
@@ -607,6 +625,7 @@ export function readPack(pack: Buffer, resolveBase?: ObjectLookup): PackReadResu
   }
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
+  const packBody = pack.subarray(0, trailerStart);
   let offset = 12;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
@@ -628,7 +647,7 @@ export function readPack(pack: Buffer, resolveBase?: ObjectLookup): PackReadResu
     } else if (!CODE_TYPE[typeCode]) {
       throw new Error(`pack entry ${index} has unknown type code ${typeCode}`);
     }
-    const inflated = inflateAt(pack.subarray(0, trailerStart), offset);
+    const inflated = inflateAt(packBody, offset);
     if (inflated.data.length !== header.size) {
       throw new Error(`pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`);
     }

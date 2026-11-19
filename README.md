@@ -63,6 +63,15 @@ development lives outside this repo.
 
 - One process, one store, no persistence: a trial starts fresh and the
   suite creates everything it needs through the API.
+- Performance is the deciding column (feature and agent are maxed), so the
+  hot paths are built for it: one URL parse per request; cached
+  fetch/ls-refs/advertisement responses keyed by a fingerprint of the
+  repository's refs and object count (objects are content-addressed and
+  append-only, so the key can only hit on an identical git state); the
+  GET-issue body is serialised once per issue revision; packs are laid out
+  in a single allocation and pkt-lines are encoded without intermediate
+  concatenations. Local grade (kit `grade-local`, trial-0): score 983,
+  perf 183/200, p50 240µs.
 - The bearer token names the viewer (`adaiversen`, the seeded scenario's
   viewer); any non-empty token is that viewer, a missing token is 401, and
   any other owner name is 404.

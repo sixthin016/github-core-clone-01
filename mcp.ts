@@ -184,6 +184,8 @@ function callTool(store: Store, name: string, args: Record<string, unknown>): To
         labels: [],
         createdSeq: repo.nextSeq(),
         comments: [],
+        rev: 0,
+        jsonCache: null,
       };
       repo.issues.set(number, issue);
       return okResult(issueJson(repo, issue));

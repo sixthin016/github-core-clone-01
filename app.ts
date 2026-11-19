@@ -12,19 +12,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGit } from './git-http.ts';
 import { handleGraphQL } from './graphql.ts';
-import { pathSegments, sendError, sendJson } from './http.ts';
+import { parseRequest, pathSegments, sendError, sendJson } from './http.ts';
 import { handleMcp } from './mcp.ts';
 import { handleRest } from './rest.ts';
 import { Store } from './store.ts';
-
-/** The path of a request URL, or '/' when it does not parse (never a throw). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
@@ -32,9 +23,11 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
+        // Parse the URL once; every handler reads the stash via http.ts.
+        (req as IncomingMessage & { _parsed?: unknown })._parsed = parseRequest(req);
         const segments = pathSegments(req);
         const method = req.method ?? 'GET';
-        const path = pathOf(req);
+        const path = (req as IncomingMessage & { _parsed?: { path: string } })._parsed!.path;
 
         // The env's boot check calls this twice: 200 {"ok":true}.
         if (method === 'GET' && path === '/healthz') {

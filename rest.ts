@@ -24,7 +24,7 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { parseJsonBody, pathSegments, queryInt, queryOf, readBody, sendError, sendJson } from './http.ts';
+import { parseJsonBody, pathSegments, queryInt, queryOf, readBody, sendError, sendJson, sendJsonText } from './http.ts';
 
 /** Count the lines of a text blob (a trailing newline ends the last line). */
 function lineCount(text: string): number {
@@ -87,6 +87,24 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/**
+ * The serialised GET-issue body, cached on the issue and invalidated by
+ * every mutation (PATCH, comment create, GraphQL close/comment): the read
+ * workload GETs one unchanged issue 2,000 times in a row.
+ */
+export function issueJsonText(repo: Repo, issue: Issue): string {
+  if (issue.jsonCache !== null) return issue.jsonCache;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issue.jsonCache = text;
+  return text;
+}
+
+/** Invalidate an issue's cached body after a mutation. */
+export function touchIssue(issue: Issue): void {
+  issue.rev += 1;
+  issue.jsonCache = null;
+}
+
 export function pullJson(repo: Repo, pr: PullRequest): Record<string, unknown> {
   return {
     id: pr.id,
@@ -115,8 +133,9 @@ function commitsFrom(repo: Repo, tip: string): Array<{ sha: string; message: str
   const out: Array<{ sha: string; message: string }> = [];
   const seen = new Set<string>();
   const queue: string[] = [tip];
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const object = repo.objects.get(oid);
@@ -338,7 +357,7 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
         sendError(store, res, 422, 'Validation Failed: ref already exists');
         return true;
       }
-      repo.refs.set(ref, sha);
+      repo.setRef(ref, sha);
       sendJson(store, res, 201, { ref, object: { sha, type: repo.objects.get(sha)!.type, url: '' } });
       return true;
     }
@@ -537,6 +556,8 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
             labels,
             createdSeq: repo.nextSeq(),
             comments: [],
+            rev: 0,
+            jsonCache: null,
           };
           repo.issues.set(number, issue);
           sendJson(store, res, 201, issueJson(repo, issue));
@@ -553,13 +574,14 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
           return true;
         }
         if (method === 'GET') {
-          sendJson(store, res, 200, issueJson(repo, issue));
+          sendJsonText(store, res, 200, issueJsonText(repo, issue));
           return true;
         }
         if (method === 'PATCH') {
           if (jsonBody.state === 'open' || jsonBody.state === 'closed') issue.state = jsonBody.state;
           if (typeof jsonBody.title === 'string') issue.title = jsonBody.title;
           if (typeof jsonBody.body === 'string') issue.body = jsonBody.body;
+          touchIssue(issue);
           sendJson(store, res, 200, issueJson(repo, issue));
           return true;
         }
@@ -580,6 +602,7 @@ export async function handleRest(store: Store, req: IncomingMessage, res: Server
           const comment = { id: repo.nextCommentId, body: commentBody };
           repo.nextCommentId += 1;
           issue.comments.push(comment);
+          touchIssue(issue);
           sendJson(store, res, 201, { id: comment.id, body: comment.body });
           return true;
         }

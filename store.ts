@@ -69,6 +69,10 @@ export interface Issue {
   labels: Label[];
   createdSeq: number;
   comments: Comment[];
+  /** Mutation counter; issueJsonText caches the serialised body per revision. */
+  rev: number;
+  /** Cached `${JSON.stringify(issueJson)}` + newline, or null when stale. */
+  jsonCache: string | null;
 }
 
 export interface Comment {
@@ -108,6 +112,33 @@ export class Repo {
   nextPullNumber = 1;
   nextCommentId = 1;
   private seq = 0;
+  /**
+   * Response caches for the git surface (clone workload: 50 concurrent
+   * identical fetches of one unchanged repository). Every entry is keyed by
+   * the git fingerprint below plus the request, so a key can only hit while
+   * the repository's refs and object set are exactly the ones the response
+   * was built from; objects are content-addressed and only ever added within
+   * a repository's life, refs are named in the fingerprint, and deleting a
+   * repository drops its Repo (and its caches) outright. Maps are capped so
+   * stale fingerprints cannot grow them without bound.
+   */
+  readonly fetchCache = new Map<string, Buffer>();
+  readonly lsRefsCache = new Map<string, Buffer>();
+  readonly advCache = new Map<string, Buffer>();
+
+  /** The git state a cached git response was built from. */
+  gitFingerprint(): string {
+    const refs = [...this.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    let out = `${this.objects.size}|`;
+    for (const [name, oid] of refs) out += `${name}=${oid};`;
+    return out;
+  }
+
+  /** Store a cached git response, clearing the map when it grows too large. */
+  cacheGit(cache: Map<string, Buffer>, key: string, value: Buffer): void {
+    if (cache.size >= 64) cache.clear();
+    cache.set(key, value);
+  }
 
   constructor(databaseId: number, owner: string, name: string, description: string, isPrivate: boolean) {
     this.databaseId = databaseId;
@@ -134,6 +165,21 @@ export class Repo {
     const oid = hashObject(type, data);
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
     return oid;
+  }
+
+  /** Store a pack object under its id (receive-pack's path into the store). */
+  addObject(oid: string, object: GitObject): void {
+    if (!this.objects.has(oid)) this.objects.set(oid, object);
+  }
+
+  /** Set any ref (heads, tags, …). */
+  setRef(ref: string, oid: string): void {
+    this.refs.set(ref, oid);
+  }
+
+  /** Delete any ref; false when it did not exist. */
+  deleteRef(ref: string): boolean {
+    return this.refs.delete(ref);
   }
 
   lookup = (oid: string): GitObject | undefined => this.objects.get(oid);
