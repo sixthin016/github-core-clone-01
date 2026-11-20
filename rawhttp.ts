@@ -61,6 +61,10 @@ const REASONS: Record<number, string> = {
 const MAX_HEADER_BYTES = 64 * 1024;
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
+/** One shared empty buffer: every GET (framing 'none') and every bodiless
+ * reply used to allocate a fresh zero-length Buffer per request. */
+export const EMPTY_BUFFER: Buffer = Buffer.alloc(0);
+
 /** The Date header, refreshed at most once a second (node:http sends one too). */
 let cachedDate = '';
 let cachedDateAt = 0;
@@ -146,28 +150,37 @@ function parseHead(buf: Buffer): ParsedHead | null {
   const version = buf.toString('latin1', secondSpace + 1, lineEnd);
   const headers: Record<string, string> = {};
   let pos = lineEnd + 2;
+  // Single-pass scan of the header block (lineEnd+2 .. end): for each line,
+  // its CRLF and its first ':' are found in one byte loop — the old code paid
+  // one indexOf('\r\n') plus one subarray indexOf(':') per header line.
+  // `end` is the CRLF that closes the last header line, so the scan runs to
+  // `end` inclusive and always finds it.
   while (pos < end) {
-    const eol = buf.indexOf('\r\n', pos);
-    const stop = eol === -1 ? end : eol;
-    // ':' search bounded to this line (a view, no copy).
-    const colon = buf.subarray(pos, stop).indexOf(0x3a);
+    let colon = -1;
+    let eol = -1;
+    for (let j = pos; j <= end; j += 1) {
+      const c = buf[j]!;
+      if (c === 0x3a && colon === -1) colon = j;
+      else if (c === 0x0d && buf[j + 1] === 0x0a) { eol = j; break; }
+    }
+    if (eol === -1) break;
     if (colon !== -1) {
       // The name, trimmed of surrounding blanks (the old code trimmed the
       // whole name string); only a name of a known length can be one the
       // handlers read, so anything else is skipped without allocating.
       let nameStart = pos;
-      let nameEnd = pos + colon;
+      let nameEnd = colon;
       while (nameStart < nameEnd && (buf[nameStart] === 0x20 || buf[nameStart] === 0x09)) nameStart += 1;
       while (nameEnd > nameStart && (buf[nameEnd - 1] === 0x20 || buf[nameEnd - 1] === 0x09)) nameEnd -= 1;
       const nameLen = nameEnd - nameStart;
       const known = KNOWN_HEADER_BY_LENGTH[nameLen];
       if (known !== undefined && headerNameMatches(buf, nameStart, nameLen, known)) {
-        const value = buf.toString('latin1', pos + colon + 1, stop).trim();
+        const value = buf.toString('latin1', colon + 1, eol).trim();
         const prev = headers[known];
         headers[known] = prev === undefined ? value : `${prev}, ${value}`;
       }
     }
-    pos = stop + 2;
+    pos = eol + 2;
   }
   let url = rawUrl;
   if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -252,7 +265,7 @@ export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) =
         body = parsed.body;
         consumed = head.headLen + parsed.consumed;
       } else {
-        body = Buffer.alloc(0);
+        body = EMPTY_BUFFER;
         consumed = head.headLen;
       }
       buf = buf.subarray(consumed);
@@ -294,9 +307,9 @@ export function createRawServer(onRequest: (req: RawRequest, res: RawResponse) =
           const state = res as RawResponse & { _status?: number; _headers?: Record<string, string | number> };
           const status = state._status ?? 200;
           const headers = state._headers ?? {};
-          const body = chunk === undefined ? Buffer.alloc(0) : typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+          const body = chunk === undefined ? EMPTY_BUFFER : typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
           const noBody = status === 204 || status === 304;
-          const out = noBody ? Buffer.alloc(0) : body;
+          const out = noBody ? EMPTY_BUFFER : body;
           // One string build, one Buffer.from: the old version built a lines
           // array and joined it per response.
           let headStr = `HTTP/1.1 ${status} ${REASONS[status] ?? ''}\r\n`;

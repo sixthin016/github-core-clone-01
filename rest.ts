@@ -25,6 +25,7 @@ import {
   type Store,
 } from './store.ts';
 import { parseJsonBody, pathSegments, queryInt, queryOf, readBody, sendError, sendJson, sendJsonBuffer, sendJsonText } from './http.ts';
+import { EMPTY_BUFFER } from './rawhttp.ts';
 
 /** Count the lines of a text blob (a trailing newline ends the last line). */
 function lineCount(text: string): number {
@@ -233,7 +234,7 @@ export async function handleRest(store: Store, req: RawRequest, res: RawResponse
     return true;
   }
 
-  const bodyBuffer = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+  const bodyBuffer = method === 'GET' || method === 'HEAD' ? EMPTY_BUFFER : await readBody(req);
   let body: unknown = {};
   if (bodyBuffer.length > 0) {
     const parsed = parseJsonBody(bodyBuffer);
